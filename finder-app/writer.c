@@ -21,7 +21,7 @@ int main(int argc, char *argv[])
     if (argc != 3) {
 		// Write error message to stderr stream
         fprintf(stderr, "Usage: %s <writefile> <writestr>\n", argv[0]);
-        syslog(LOG_ERR, "Invalid number of arguments: %d; expected 2", (argc - 1));
+        syslog(LOG_ERR, "Invalid number of arguments: expected 2 but got %d", (argc - 1));
         closelog();
         return EXIT_ERROR;
     }
@@ -31,14 +31,14 @@ int main(int argc, char *argv[])
     writefile = fopen(argv[1], "w");
     if (writefile == NULL) {
         perror("Error opening output file");
-        syslog(LOG_ERR, "Error occured when opening file %s", argv[1]);
+        syslog(LOG_ERR, "Error occured when opening file: %s", argv[1]);
         closelog();
         return EXIT_ERROR;
     }
 
 
     /* Write to File */
-    syslog(LOG_DEBUG, "Writing %s to %s", argv[2], argv[1]);
+    syslog(LOG_DEBUG, "Writing '%s' to '%s'", argv[2], argv[1]);
     // ChatGPT reference used to correctly understand file writing formating: https://chatgpt.com/s/t_696e661cd15c8191abf1c46dbd15ffe2
     writestr = argv[2];
     fputs(writestr, writefile);
