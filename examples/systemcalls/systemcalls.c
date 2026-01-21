@@ -1,5 +1,11 @@
 #include "systemcalls.h"
 
+#include <fcntl.h>
+#include <unistd.h>
+#include <sys/wait.h>
+#include <errno.h>
+#include <stdlib.h>
+
 /**
  * @param cmd the command to execute with system()
  * @return true if the command in @param cmd was executed
@@ -9,13 +15,13 @@
 */
 bool do_system(const char *cmd)
 {
-
-/*
- * TODO  add your code here
- *  Call the system() function with the command set in the cmd
- *   and return a boolean true if the system() call completed with success
- *   or false() if it returned a failure
-*/
+	int retval = 0;
+	retval = system(cmd);
+	
+	if(retval != 0)
+	{
+		return false;
+	}
 
     return true;
 }
@@ -45,23 +51,39 @@ bool do_exec(int count, ...)
         command[i] = va_arg(args, char *);
     }
     command[count] = NULL;
-    // this line is to avoid a compile warning before your implementation is complete
-    // and may be removed
-    command[count] = command[count];
 
-/*
- * TODO:
- *   Execute a system command by calling fork, execv(),
- *   and wait instead of system (see LSP page 161).
- *   Use the command[0] as the full path to the command to execute
- *   (first argument to execv), and use the remaining arguments
- *   as second argument to the execv() command.
- *
-*/
+	// Following code block written with guidance from ChatGPT: https://chatgpt.com/share/69712993-15bc-8007-b18c-9d87b47cb5be
+	pid_t pid = fork();
+	if(pid < 0) // fork() failed
+	{
+		perror("Fork");
+		return false;
+	}
+	
+	if(pid == 0) // child process task
+	{
+		execv(command[0], command);
+		perror("execv");
+		_exit(127); // return code 127 if execv() fails
+	}
+	
+	// Remaining parent process task
+	int status;
+	if(waitpid(pid, &status, 0) < 0)
+	{
+		return false; // Waiting failed for some reason
+	}
+	
+	// If execv succeeded, the child would exit with 0
+    if (WIFEXITED(status) && WEXITSTATUS(status) == 0) 
+    { // Command run successfully
+		va_end(args);
+        return true;
+    }
 
+	// Otherwise, command failed
     va_end(args);
-
-    return true;
+    return false;
 }
 
 /**
@@ -80,10 +102,6 @@ bool do_exec_redirect(const char *outputfile, int count, ...)
         command[i] = va_arg(args, char *);
     }
     command[count] = NULL;
-    // this line is to avoid a compile warning before your implementation is complete
-    // and may be removed
-    command[count] = command[count];
-
 
 /*
  * TODO
@@ -92,8 +110,46 @@ bool do_exec_redirect(const char *outputfile, int count, ...)
  *   The rest of the behaviour is same as do_exec()
  *
 */
+	// Following code block written with reference from: https://stackoverflow.com/a/13784315/1446624
+	int fd = open(outputfile, O_WRONLY|O_TRUNC|O_CREAT, 0644);
+	if(fd < 0)
+	{ // Opening file failed
+		perror("File open");
+		return false;
+	}
 
+	// Following code block written with guidance from ChatGPT: https://chatgpt.com/share/69712993-15bc-8007-b18c-9d87b47cb5be
+	pid_t pid = fork();
+	if(pid < 0) // fork() failed
+	{
+		perror("Fork");
+		return false;
+	}
+	
+	if(pid == 0) // child process task
+	{
+		if (dup2(fd, 1) < 0) { perror("dup2"); abort(); } // duplicate fd to replace stdout
+		close(fd); // Child does not need this file any more
+		execv(command[0], command);
+		perror("execv");
+		_exit(127); // return code 127 if execv() fails
+	}
+	
+	// Remaining parent process task
+	int status;
+	if(waitpid(pid, &status, 0) < 0)
+	{
+		return false; // Waiting failed for some reason
+	}
+	
+	// If execv succeeded, the child would exit with 0
+    if (WIFEXITED(status) && WEXITSTATUS(status) == 0) 
+    { // Command run successfully
+		va_end(args);
+        return true;
+    }
+
+	// Otherwise, command failed
     va_end(args);
-
-    return true;
+    return false;
 }
