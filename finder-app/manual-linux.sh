@@ -2,7 +2,9 @@
 # Script outline to install and build kernel.
 # Author: Siddhant Jajoo.
 # Completed by: Jordan Kooyman
-# Used DeepSeek to assist with TODO section completion: https://chat.deepseek.com/share/7p9wb4vuyfxistvdkd
+# Used DeepSeek to assist with TODO section completion and debugging: https://chat.deepseek.com/share/z98jn2gzxbq1cy2vn3
+
+# Install dependencies: sudo apt-get update && sudo apt-get install -y --no-install-recommends bc u-boot-tools kmod cpio flex bison libssl-dev psmisc && sudo apt-get install -y qemu-system-arm
 
 set -e
 set -u
@@ -50,7 +52,8 @@ if [ ! -e ${OUTDIR}/linux-stable/arch/${ARCH}/boot/Image ]; then
     make ARCH=${ARCH} CROSS_COMPILE=${CROSS_COMPILE} all -j$(nproc)
 fi
 
-echo "Adding the Image in outdir"
+echo "Copying kernel Image to ${OUTDIR}"
+cp ${OUTDIR}/linux-stable/arch/${ARCH}/boot/Image ${OUTDIR}/Image
 
 echo "Creating the staging directory for the root filesystem"
 cd "$OUTDIR"
@@ -89,35 +92,73 @@ fi
 make ARCH=${ARCH} CROSS_COMPILE=${CROSS_COMPILE} -j$(nproc)
 make ARCH=${ARCH} CROSS_COMPILE=${CROSS_COMPILE} CONFIG_PREFIX=${OUTDIR}/rootfs install
 
-echo "Library dependencies"
-${CROSS_COMPILE}readelf -a bin/busybox | grep "program interpreter"
-${CROSS_COMPILE}readelf -a bin/busybox | grep "Shared library"
+echo "Checking Library dependencies"
+cd "$OUTDIR/rootfs"
+if [ -f "bin/busybox" ]; then
+    echo "Checking for dynamic dependencies..."
+    if ${CROSS_COMPILE}readelf -a bin/busybox | grep -q "program interpreter"; then
+        ${CROSS_COMPILE}readelf -a bin/busybox | grep "program interpreter"
+    else
+        echo "Program interpreter: None (static binary)"
+    fi
+    
+    if ${CROSS_COMPILE}readelf -a bin/busybox | grep -q "Shared library"; then
+        ${CROSS_COMPILE}readelf -a bin/busybox | grep "Shared library"
+    else
+        echo "Shared libraries: None (static binary)"
+    fi
+else
+    echo "WARNING: BusyBox not found in rootfs/bin/"
+fi
 
 # TODO: Add library dependencies to rootfs
+echo "Adding library dependencies to rootfs"
 # Find the cross-compiler toolchain path
 CROSS_COMPILER_PATH=$(dirname $(which ${CROSS_COMPILE}gcc))/../aarch64-none-linux-gnu/libc
 
 # Copy the dynamic linker/loader
+echo "Dynamic linker/loader"
 cp ${CROSS_COMPILER_PATH}/lib/ld-linux-aarch64.so.1 ${OUTDIR}/rootfs/lib
 
 # Copy required shared libraries
-cp ${CROSS_COMPILER_PATH}/lib/libc.so.6 ${OUTDIR}/rootfs/lib
-cp ${CROSS_COMPILER_PATH}/lib/libm.so.6 ${OUTDIR}/rootfs/lib
-cp ${CROSS_COMPILER_PATH}/lib/libresolv.so.2 ${OUTDIR}/rootfs/lib
+echo "Copy shared libs"
+# Function to copy a library if it exists
+copy_lib() {
+    local lib_name=$1
+    local lib_path=$(${CROSS_COMPILE}gcc -print-file-name=$lib_name)
+    if [ -f "$lib_path" ]; then
+        echo "Copying $lib_name from $lib_path"
+        cp "$lib_path" "${OUTDIR}/rootfs/lib/"
+    else
+        echo "WARNING: Could not find $lib_name"
+    fi
+}
+
+# Copy essential libraries
+copy_lib "ld-linux-aarch64.so.1"
+copy_lib "libc.so.6"
+copy_lib "libm.so.6"
+copy_lib "libresolv.so.2"
+#cp ${CROSS_COMPILER_PATH}/lib/libc.so.6 ${OUTDIR}/rootfs/lib
+#cp ${CROSS_COMPILER_PATH}/lib/libm.so.6 ${OUTDIR}/rootfs/lib
+#cp ${CROSS_COMPILER_PATH}/lib/libresolv.so.2 ${OUTDIR}/rootfs/lib
 # TODO: Add other libraries as needed based on readelf output
 
 # TODO: Make device nodes
+echo "Make Device Nodes"
 cd "$OUTDIR/rootfs/dev"
 sudo mknod -m 666 null c 1 3
 sudo mknod -m 666 console c 5 1
 
 # TODO: Clean and build the writer utility for aarch64
+echo "Builder writer for target platform"
 cd ${FINDER_APP_DIR}
 make clean
 make CROSS_COMPILE=${CROSS_COMPILE}
 
 # TODO: Copy the finder related scripts and executables to the /home directory
 # on the target rootfs
+echo "Copy finder-app assignment components to rootfs/home"
 cd "$OUTDIR/rootfs"
 mkdir -p home/conf
 cp ${FINDER_APP_DIR}/writer home/
@@ -128,10 +169,14 @@ cp ${FINDER_APP_DIR}/conf/username.txt home/conf/
 cp ${FINDER_APP_DIR}/conf/assignment.txt home/conf/
 
 # TODO: Chown the root directory
+echo "Update rootfs owner"
 cd "${OUTDIR}/rootfs"
 sudo chown -R root:root *
 
 # TODO: Create initramfs.cpio.gz
+echo "Creating initramfs.cpio.gz"
 cd "${OUTDIR}/rootfs"
 find . | cpio -H newc -ov --owner root:root > ${OUTDIR}/initramfs.cpio
 gzip -f ${OUTDIR}/initramfs.cpio
+
+echo "Done"
