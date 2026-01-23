@@ -42,8 +42,8 @@ if [ ! -e ${OUTDIR}/linux-stable/arch/${ARCH}/boot/Image ]; then
     # Clean previous builds (optional but recommended for fresh build)
     make ARCH=${ARCH} CROSS_COMPILE=${CROSS_COMPILE} distclean
 
-    # Configure kernel with default aarch64 configuration
-    make ARCH=${ARCH} CROSS_COMPILE=${CROSS_COMPILE} defconfig
+    # Configure kernel with default aarch64 configuration (pipe inn 'yes' to any prompts in case they exist)
+    yes "y" | make ARCH=${ARCH} CROSS_COMPILE=${CROSS_COMPILE} defconfig
 
     # Or optionally use a custom config
     # cp /path/to/custom.config .config
