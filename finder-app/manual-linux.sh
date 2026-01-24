@@ -182,27 +182,6 @@ make CROSS_COMPILE=${CROSS_COMPILE}
 # Restore original Makefile
 mv Makefile.backup Makefile
 
-# Verify static linking
-echo "Verifying writer is static:"
-file writer
-if file writer | grep -q "statically linked"; then
-    echo "✓ Writer is statically linked"
-else
-    echo "✗ Writer is not static, trying alternative..."
-    # Force static with all libraries
-    ${CROSS_COMPILE}gcc -o writer writer.c \
-        -static \
-        -static-libgcc \
-        -static-libstdc++ \
-        -Wall \
-        -Werror
-fi
-
-# Final verification
-echo "Final check:"
-file writer
-${CROSS_COMPILE}readelf -d writer 2>/dev/null | grep "Shared library" || echo "No shared library dependencies (good!)"
-
 # TODO: Copy the finder related scripts and executables to the /home directory
 # on the target rootfs
 echo "Copy finder-app assignment components to rootfs/home"
