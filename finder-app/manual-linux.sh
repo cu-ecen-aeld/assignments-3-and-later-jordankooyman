@@ -2,7 +2,7 @@
 # Script outline to install and build kernel.
 # Author: Siddhant Jajoo.
 # Completed by: Jordan Kooyman
-# Used DeepSeek to assist with TODO section completion and debugging: https://chat.deepseek.com/share/6jmqb9vfgmauqeha03
+# Used DeepSeek to assist with TODO section completion and debugging: https://chat.deepseek.com/share/ne0ufdg67l7zvab9v8
 
 # Install dependencies: sudo apt-get update && sudo apt-get install -y --no-install-recommends bc u-boot-tools kmod cpio flex bison libssl-dev psmisc && sudo apt-get install -y qemu-system-arm
 
@@ -96,7 +96,7 @@ then
     echo "CONFIG_STATIC_LIBGCC=y" >> .config  # The one that's prompting!
     
     # Update configuration non-interactively
-    make ARCH=${ARCH} CROSS_COMPILE=${CROSS_COMPILE} olddefconfig
+    yes 'y' | make ARCH=${ARCH} CROSS_COMPILE=${CROSS_COMPILE} oldconfig
     
 else
     cd busybox
