@@ -2,7 +2,7 @@
 # Script outline to install and build kernel.
 # Author: Siddhant Jajoo.
 # Completed by: Jordan Kooyman
-# Used DeepSeek to assist with TODO section completion and debugging: https://chat.deepseek.com/share/z98jn2gzxbq1cy2vn3
+# Used DeepSeek to assist with TODO section completion and debugging: https://chat.deepseek.com/share/8cijkbrnk22u3730ot
 
 # Install dependencies: sudo apt-get update && sudo apt-get install -y --no-install-recommends bc u-boot-tools kmod cpio flex bison libssl-dev psmisc && sudo apt-get install -y qemu-system-arm
 
@@ -39,14 +39,17 @@ if [ ! -e ${OUTDIR}/linux-stable/arch/${ARCH}/boot/Image ]; then
     git checkout ${KERNEL_VERSION}
 
     # TODO: Add your kernel build steps here
-    # Clean previous builds (optional but recommended for fresh build)
+    # Clean previous builds
     make ARCH=${ARCH} CROSS_COMPILE=${CROSS_COMPILE} distclean
 
-    # Configure kernel with default aarch64 configuration (pipe inn 'yes' to any prompts in case they exist)
-    yes "y" | make ARCH=${ARCH} CROSS_COMPILE=${CROSS_COMPILE} defconfig
+    # First, get default configuration
+    make ARCH=${ARCH} CROSS_COMPILE=${CROSS_COMPILE} defconfig
 
-    # Or optionally use a custom config
-    # cp /path/to/custom.config .config
+    # Now set static libgcc BEFORE running oldconfig/olddefconfig
+    echo "CONFIG_CC_STATIC_LIBGCC=y" >> .config
+
+    # Update configuration non-interactively
+    yes "" | make ARCH=${ARCH} CROSS_COMPILE=${CROSS_COMPILE} oldconfig
 
     # Build the kernel
     make ARCH=${ARCH} CROSS_COMPILE=${CROSS_COMPILE} all -j$(nproc)
@@ -154,7 +157,40 @@ sudo mknod -m 666 console c 5 1
 echo "Builder writer for target platform"
 cd ${FINDER_APP_DIR}
 make clean
+echo "Using Makefile with static flags..."
+# Create a modified Makefile for static build
+cp Makefile Makefile.backup
+# Add -static to the linking stage
+sed -i 's/$(CC) $(CFLAGS) $^ -o $@ $(LDFLAGS)/$(CC) $(CFLAGS) $^ -o $@ $(LDFLAGS) -static/' Makefile 2>/dev/null || \
+sed -i 's/^LDFLAGS =/LDFLAGS = -static/' Makefile 2>/dev/null || \
+echo 'LDFLAGS += -static' >> Makefile
+
+make clean
 make CROSS_COMPILE=${CROSS_COMPILE}
+
+# Restore original Makefile
+mv Makefile.backup Makefile
+
+# Verify static linking
+echo "Verifying writer is static:"
+file writer
+if file writer | grep -q "statically linked"; then
+    echo "✓ Writer is statically linked"
+else
+    echo "✗ Writer is not static, trying alternative..."
+    # Force static with all libraries
+    ${CROSS_COMPILE}gcc -o writer writer.c \
+        -static \
+        -static-libgcc \
+        -static-libstdc++ \
+        -Wall \
+        -Werror
+fi
+
+# Final verification
+echo "Final check:"
+file writer
+${CROSS_COMPILE}readelf -d writer 2>/dev/null | grep "Shared library" || echo "No shared library dependencies (good!)"
 
 # TODO: Copy the finder related scripts and executables to the /home directory
 # on the target rootfs
