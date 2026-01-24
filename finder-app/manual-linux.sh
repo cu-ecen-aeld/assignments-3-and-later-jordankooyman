@@ -2,7 +2,7 @@
 # Script outline to install and build kernel.
 # Author: Siddhant Jajoo.
 # Completed by: Jordan Kooyman
-# Used DeepSeek to assist with TODO section completion and debugging: https://chat.deepseek.com/share/8cijkbrnk22u3730ot
+# Used DeepSeek to assist with TODO section completion and debugging: https://chat.deepseek.com/share/6jmqb9vfgmauqeha03
 
 # Install dependencies: sudo apt-get update && sudo apt-get install -y --no-install-recommends bc u-boot-tools kmod cpio flex bison libssl-dev psmisc && sudo apt-get install -y qemu-system-arm
 
@@ -77,16 +77,27 @@ mkdir -p var/log
 cd "$OUTDIR"
 if [ ! -d "${OUTDIR}/busybox" ]
 then
-git clone git://busybox.net/busybox.git
+    git clone git://busybox.net/busybox.git
     cd busybox
     git checkout ${BUSYBOX_VERSION}
-    # TODO:  Configure busybox
+    
+    # TODO: Configure busybox
     make distclean
     make ARCH=${ARCH} CROSS_COMPILE=${CROSS_COMPILE} defconfig
-    # Enable static linking to avoid library dependencies
-    sed -i 's/.*CONFIG_STATIC.*/CONFIG_STATIC=y/' .config
-    # Alternatively, configure interactively:
-    # make ARCH=${ARCH} CROSS_COMPILE=${CROSS_COMPILE} menuconfig
+    
+    # Enable static linking
+    echo "CONFIG_STATIC=y" >> .config
+    
+    # Set other options to avoid prompts
+    echo "CONFIG_EXTRA_LDFLAGS=\"\"" >> .config
+    echo "CONFIG_EXTRA_LDLIBS=\"\"" >> .config
+    echo "CONFIG_USE_PORTABLE_CODE=n" >> .config
+    echo "CONFIG_STACK_OPTIMIZATION_386=y" >> .config  # Default is y
+    echo "CONFIG_STATIC_LIBGCC=y" >> .config  # The one that's prompting!
+    
+    # Update configuration non-interactively
+    make ARCH=${ARCH} CROSS_COMPILE=${CROSS_COMPILE} olddefconfig
+    
 else
     cd busybox
 fi
