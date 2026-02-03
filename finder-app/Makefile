@@ -14,7 +14,7 @@ OBJ     := $(SRC:.c=.o)
 
 # Flags
 CFLAGS  := -Wall -Wextra -O2
-LDFLAGS :=
+LDFLAGS := -static -static-libgcc
 
 # Default target
 all: $(TARGET)
