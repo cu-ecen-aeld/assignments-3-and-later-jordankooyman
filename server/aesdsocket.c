@@ -1,16 +1,19 @@
 /*
  * aesdsocket.c - Socket server that receives and stores data packets
+ * Enhanced with thread management and timestamps
  * 
  * Features:
  * - Listens on port 9000 for TCP connections
  * - Receives data until newline, appends to /var/tmp/aesdsocketdata
  * - Returns entire file content after each complete packet
  * - Supports daemon mode with -d flag
- * - Graceful shutdown on SIGINT/SIGTERM
+ * - Supports multiple simultaneous socket connections with threads
+ * - Graceful shutdown on SIGINT/SIGTERM (including all spawned threads)
+ * - Includes timestamps written to output file every 10 seconds
  * - Cross-platform compatible for x86_64 and ARM64
  * 
  * 	Version 1 Code: https://chat.deepseek.com/share/92ytxo7wnlhuiigbbf
- *	Version 2 Code (this): https://chat.deepseek.com/share/v6z76kub49dzcpxmqa
+ *	Version 2 Code (this): https://chat.deepseek.com/share/qtyyz0zhqx67gk3lir
  *   Comparison: https://chatgpt.com/share/697cea7e-2700-8007-8fa5-a7edea60a08d
  */
 
@@ -30,37 +33,40 @@
 #include <pthread.h>
 #include <stdbool.h>
 #include <stdint.h>
+#include <time.h>
 
 /* Configuration constants */
 #define PORT 9000
 #define DATA_FILE "/var/tmp/aesdsocketdata"
 #define RECV_BUFFER_SIZE 1024
-#define MAX_PACKET_SIZE (10 * 1024 * 1024) /* 10MB max packet size */
-#define MAX_CONCURRENT_THREADS 10          /* Limit concurrent connections */
+#define MAX_PACKET_SIZE (10 * 1024 * 1024)
+#define TIMESTAMP_INTERVAL 10 /* seconds */
 
-/* Thread management structure */
-typedef struct {
-    pthread_t thread;
-    bool active;
+/* Thread node for linked list */
+struct thread_node {
+    pthread_t thread_id;
     int client_fd;
-    char client_ip[INET_ADDRSTRLEN];
-    uint64_t thread_id;
-} thread_info_t;
+    struct sockaddr_in client_addr;
+    bool active;
+    struct thread_node *next;
+};
 
 /* Thread argument structure */
 struct thread_args {
     int client_fd;
-    char client_ip[INET_ADDRSTRLEN];
-    uint64_t thread_id;
+    struct sockaddr_in client_addr;
 };
 
-/* Global variables for signal handling and cleanup */
+/* Global variables */
 static volatile sig_atomic_t shutdown_requested = 0;
 static int server_fd = -1;
 static pthread_mutex_t file_mutex = PTHREAD_MUTEX_INITIALIZER;
-static pthread_mutex_t threads_mutex = PTHREAD_MUTEX_INITIALIZER;
-static thread_info_t thread_pool[MAX_CONCURRENT_THREADS];
-static int active_thread_count = 0;
+static pthread_mutex_t thread_list_mutex = PTHREAD_MUTEX_INITIALIZER;
+static struct thread_node *thread_list_head = NULL;
+static pthread_t timestamp_thread;
+static bool timestamp_thread_running = false;
+static pthread_mutex_t timestamp_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t timestamp_cond = PTHREAD_COND_INITIALIZER;
 static bool daemon_mode = false;
 
 /* Forward declarations */
@@ -69,13 +75,13 @@ static int setup_signal_handlers(void);
 static int setup_server_socket(void);
 static void cleanup_resources(void);
 static void *connection_handler(void *arg);
+static void *timestamp_thread_func(void *arg);
 static int run_as_daemon(void);
 static int write_data_to_file(const char *data, size_t length);
 static int read_and_send_file(int client_fd);
+static void add_thread_to_list(pthread_t thread_id, int client_fd, struct sockaddr_in *client_addr);
+static void remove_thread_from_list(pthread_t thread_id);
 static void wait_for_all_threads(void);
-static bool can_accept_new_connection(void);
-static void register_thread(pthread_t thread, int client_fd, const char *client_ip, uint64_t thread_id);
-static void unregister_thread(pthread_t thread);
 
 /*
  * signal_handler - Handle SIGINT and SIGTERM signals
@@ -86,7 +92,10 @@ static void signal_handler(int signal)
         syslog(LOG_INFO, "Caught signal, exiting");
         shutdown_requested = 1;
         
-        /* Signal main thread by closing server socket */
+        /* Signal timestamp thread */
+        pthread_cond_signal(&timestamp_cond);
+        
+        /* Close server socket to unblock accept() */
         if (server_fd != -1) {
             shutdown(server_fd, SHUT_RDWR);
         }
@@ -94,7 +103,7 @@ static void signal_handler(int signal)
 }
 
 /*
- * setup_signal_handlers - Register signal handlers for graceful shutdown
+ * setup_signal_handlers - Register signal handlers
  */
 static int setup_signal_handlers(void)
 {
@@ -120,7 +129,7 @@ static int setup_signal_handlers(void)
 }
 
 /*
- * setup_server_socket - Create and configure the server socket
+ * setup_server_socket - Create and configure server socket
  */
 static int setup_server_socket(void)
 {
@@ -149,7 +158,7 @@ static int setup_server_socket(void)
         return -1;
     }
     
-    if (listen(sock_fd, MAX_CONCURRENT_THREADS) == -1) {
+    if (listen(sock_fd, SOMAXCONN) == -1) {
         syslog(LOG_ERR, "Failed to listen on socket: %s", strerror(errno));
         close(sock_fd);
         return -1;
@@ -159,14 +168,13 @@ static int setup_server_socket(void)
 }
 
 /*
- * write_data_to_file - Append data to the data file with thread safety
+ * write_data_to_file - Append data to file with mutex protection
  */
 static int write_data_to_file(const char *data, size_t length)
 {
     int fd;
     ssize_t bytes_written;
     
-    /* Lock file mutex to ensure thread-safe file access */
     pthread_mutex_lock(&file_mutex);
     
     fd = open(DATA_FILE, O_WRONLY | O_CREAT | O_APPEND, 0644);
@@ -190,7 +198,7 @@ static int write_data_to_file(const char *data, size_t length)
 }
 
 /*
- * read_and_send_file - Read entire data file and send to client with thread safety
+ * read_and_send_file - Read entire file and send to client with mutex protection
  */
 static int read_and_send_file(int client_fd)
 {
@@ -198,14 +206,12 @@ static int read_and_send_file(int client_fd)
     char buffer[RECV_BUFFER_SIZE];
     ssize_t bytes_read, bytes_sent, total_sent;
     
-    /* Lock file mutex to ensure thread-safe file access */
     pthread_mutex_lock(&file_mutex);
     
     fd = open(DATA_FILE, O_RDONLY);
     if (fd == -1) {
-        /* File might not exist yet, that's OK - just send nothing */
         pthread_mutex_unlock(&file_mutex);
-        return 0;
+        return 0; /* File doesn't exist yet */
     }
     
     while ((bytes_read = read(fd, buffer, sizeof(buffer))) > 0) {
@@ -242,61 +248,46 @@ static int read_and_send_file(int client_fd)
 }
 
 /*
- * can_accept_new_connection - Check if we can accept a new connection
+ * add_thread_to_list - Add new thread to linked list
  */
-static bool can_accept_new_connection(void)
+static void add_thread_to_list(pthread_t thread_id, int client_fd, struct sockaddr_in *client_addr)
 {
-    bool can_accept;
-    pthread_mutex_lock(&threads_mutex);
-    can_accept = (active_thread_count < MAX_CONCURRENT_THREADS);
-    pthread_mutex_unlock(&threads_mutex);
-    return can_accept;
+    struct thread_node *new_node = malloc(sizeof(struct thread_node));
+    if (!new_node) {
+        syslog(LOG_ERR, "Failed to allocate memory for thread node");
+        return;
+    }
+    
+    new_node->thread_id = thread_id;
+    new_node->client_fd = client_fd;
+    new_node->client_addr = *client_addr;
+    new_node->active = true;
+    
+    pthread_mutex_lock(&thread_list_mutex);
+    new_node->next = thread_list_head;
+    thread_list_head = new_node;
+    pthread_mutex_unlock(&thread_list_mutex);
 }
 
 /*
- * register_thread - Register a new active thread
+ * remove_thread_from_list - Remove thread from linked list
  */
-static void register_thread(pthread_t thread, int client_fd, const char *client_ip, uint64_t thread_id)
+static void remove_thread_from_list(pthread_t thread_id)
 {
-    int i;
-    pthread_mutex_lock(&threads_mutex);
+    pthread_mutex_lock(&thread_list_mutex);
     
-    /* Find free slot in thread pool */
-    for (i = 0; i < MAX_CONCURRENT_THREADS; i++) {
-        if (!thread_pool[i].active) {
-            thread_pool[i].thread = thread;
-            thread_pool[i].active = true;
-            thread_pool[i].client_fd = client_fd;
-            thread_pool[i].thread_id = thread_id;
-            if (client_ip) {
-                snprintf(thread_pool[i].client_ip, sizeof(thread_pool[i].client_ip),
-                        "%s", client_ip);
-            }
-            active_thread_count++;
+    struct thread_node **indirect = &thread_list_head;
+    while (*indirect) {
+        if (pthread_equal((*indirect)->thread_id, thread_id)) {
+            struct thread_node *to_free = *indirect;
+            *indirect = to_free->next;
+            free(to_free);
             break;
         }
+        indirect = &(*indirect)->next;
     }
     
-    pthread_mutex_unlock(&threads_mutex);
-}
-
-/*
- * unregister_thread - Unregister a completed thread
- */
-static void unregister_thread(pthread_t thread)
-{
-    int i;
-    pthread_mutex_lock(&threads_mutex);
-    
-    for (i = 0; i < MAX_CONCURRENT_THREADS; i++) {
-        if (thread_pool[i].active && pthread_equal(thread_pool[i].thread, thread)) {
-            thread_pool[i].active = false;
-            active_thread_count--;
-            break;
-        }
-    }
-    
-    pthread_mutex_unlock(&threads_mutex);
+    pthread_mutex_unlock(&thread_list_mutex);
 }
 
 /*
@@ -304,18 +295,53 @@ static void unregister_thread(pthread_t thread)
  */
 static void wait_for_all_threads(void)
 {
-    int i;
-    pthread_mutex_lock(&threads_mutex);
+    pthread_mutex_lock(&thread_list_mutex);
     
-    for (i = 0; i < MAX_CONCURRENT_THREADS; i++) {
-        if (thread_pool[i].active) {
-            pthread_join(thread_pool[i].thread, NULL);
-            thread_pool[i].active = false;
+    struct thread_node *current = thread_list_head;
+    while (current) {
+        if (current->active) {
+            pthread_join(current->thread_id, NULL);
+            current->active = false;
+        }
+        struct thread_node *to_free = current;
+        current = current->next;
+        free(to_free);
+    }
+    
+    thread_list_head = NULL;
+    pthread_mutex_unlock(&thread_list_mutex);
+}
+
+/*
+ * timestamp_thread_func - Thread function that writes timestamps every 10 seconds
+ */
+static void *timestamp_thread_func(void *arg)
+{
+    (void)arg; /* Unused parameter */
+    
+    while (!shutdown_requested) {
+        /* Wait for 10 seconds or until signaled */
+        struct timespec ts;
+        clock_gettime(CLOCK_REALTIME, &ts);
+        ts.tv_sec += TIMESTAMP_INTERVAL;
+        
+        pthread_mutex_lock(&timestamp_mutex);
+        int ret = pthread_cond_timedwait(&timestamp_cond, &timestamp_mutex, &ts);
+        pthread_mutex_unlock(&timestamp_mutex);
+        
+        /* If we timed out (not signaled), write timestamp */
+        if (ret == ETIMEDOUT && !shutdown_requested) {
+            time_t now = time(NULL);
+            struct tm *tm_info = localtime(&now);
+            char timestamp[64];
+            strftime(timestamp, sizeof(timestamp), "timestamp:%a, %d %b %Y %H:%M:%S %z\n", tm_info);
+            
+            write_data_to_file(timestamp, strlen(timestamp));
+            syslog(LOG_DEBUG, "Wrote timestamp: %s", timestamp);
         }
     }
     
-    active_thread_count = 0;
-    pthread_mutex_unlock(&threads_mutex);
+    return NULL;
 }
 
 /*
@@ -324,146 +350,109 @@ static void wait_for_all_threads(void)
 static void *connection_handler(void *arg)
 {
     struct thread_args *thread_args = (struct thread_args *)arg;
-    
     int client_fd = thread_args->client_fd;
-    char client_ip[INET_ADDRSTRLEN];
-    uint64_t thread_id = thread_args->thread_id;
-    
-    /* Copy client IP safely */
-    strncpy(client_ip, thread_args->client_ip, sizeof(client_ip) - 1);
-    client_ip[sizeof(client_ip) - 1] = '\0';
-    
+    struct sockaddr_in client_addr = thread_args->client_addr;
     free(thread_args);
+    
+    char client_ip[INET_ADDRSTRLEN];
+    inet_ntop(AF_INET, &client_addr.sin_addr, client_ip, sizeof(client_ip));
+    
+    syslog(LOG_INFO, "Accepted connection from %s", client_ip);
     
     char *packet_buffer = NULL;
     char recv_buffer[RECV_BUFFER_SIZE];
     size_t packet_size = 0;
     size_t buffer_capacity = RECV_BUFFER_SIZE;
     ssize_t bytes_received;
-    bool connection_active = true;
-    
-    syslog(LOG_INFO, "[Thread:%lu Client:%s] Accepted connection", 
-           (unsigned long)thread_id, client_ip);
     
     /* Allocate initial packet buffer */
     packet_buffer = malloc(buffer_capacity);
     if (!packet_buffer) {
-        syslog(LOG_ERR, "[Thread:%lu Client:%s] Failed to allocate packet buffer", 
-               (unsigned long)thread_id, client_ip);
+        syslog(LOG_ERR, "Failed to allocate packet buffer for %s", client_ip);
         close(client_fd);
-        unregister_thread(pthread_self());
+        remove_thread_from_list(pthread_self());
         return NULL;
     }
     
     /* Main connection loop */
-    while (connection_active && !shutdown_requested) {
+    while (!shutdown_requested) {
         bytes_received = recv(client_fd, recv_buffer, sizeof(recv_buffer) - 1, 0);
         
         if (bytes_received <= 0) {
             if (bytes_received == 0) {
-                /* Client disconnected gracefully */
-                syslog(LOG_INFO, "[Thread:%lu Client:%s] Client disconnected", 
-                       (unsigned long)thread_id, client_ip);
+                syslog(LOG_INFO, "Client %s disconnected", client_ip);
             } else if (errno == EINTR) {
-                /* Interrupted by signal, check shutdown flag */
                 continue;
             } else {
-                syslog(LOG_ERR, "[Thread:%lu Client:%s] Error receiving data: %s", 
-                       (unsigned long)thread_id, client_ip, strerror(errno));
+                syslog(LOG_ERR, "Error receiving data from %s: %s", 
+                       client_ip, strerror(errno));
             }
-            connection_active = false;
             break;
         }
         
-        /* Process received data in place */
+        /* Process received data */
         char *current_pos = recv_buffer;
         size_t remaining = bytes_received;
         
-        while (remaining > 0 && !shutdown_requested) {
-            /* Find newline in remaining data */
+        while (remaining > 0) {
             char *newline_pos = memchr(current_pos, '\n', remaining);
-            size_t chunk_size;
+            size_t chunk_size = newline_pos ? (size_t)(newline_pos - current_pos) + 1 : remaining;
             
-            if (newline_pos) {
-                /* Found newline - include it in the packet */
-                chunk_size = (newline_pos - current_pos) + 1;
-            } else {
-                /* No newline - take all remaining data */
-                chunk_size = remaining;
-            }
-            
-            /* Check if adding this chunk would exceed max packet size */
+            /* Check packet size limit */
             if (packet_size + chunk_size > MAX_PACKET_SIZE) {
-                syslog(LOG_ERR, "[Thread:%lu Client:%s] Packet exceeds maximum size (%zu + %zu > %d), discarding", 
-                       (unsigned long)thread_id, client_ip, packet_size, chunk_size, MAX_PACKET_SIZE);
+                syslog(LOG_ERR, "Packet from %s exceeds maximum size", client_ip);
                 free(packet_buffer);
                 close(client_fd);
-                unregister_thread(pthread_self());
+                remove_thread_from_list(pthread_self());
                 return NULL;
             }
             
-            /* Ensure buffer has enough capacity */
+            /* Expand buffer if needed */
             if (packet_size + chunk_size > buffer_capacity) {
                 size_t new_capacity = buffer_capacity * 2;
                 while (new_capacity < packet_size + chunk_size) {
                     new_capacity *= 2;
                 }
-                
-                /* Cap at MAX_PACKET_SIZE */
                 if (new_capacity > MAX_PACKET_SIZE) {
                     new_capacity = MAX_PACKET_SIZE;
                 }
                 
                 char *new_buffer = realloc(packet_buffer, new_capacity);
                 if (!new_buffer) {
-                    syslog(LOG_ERR, "[Thread:%lu Client:%s] Failed to expand packet buffer", 
-                           (unsigned long)thread_id, client_ip);
+                    syslog(LOG_ERR, "Failed to expand packet buffer for %s", client_ip);
                     free(packet_buffer);
                     close(client_fd);
-                    unregister_thread(pthread_self());
+                    remove_thread_from_list(pthread_self());
                     return NULL;
                 }
-                
                 packet_buffer = new_buffer;
                 buffer_capacity = new_capacity;
             }
             
-            /* Copy chunk to packet buffer */
+            /* Copy data to packet buffer */
             memcpy(packet_buffer + packet_size, current_pos, chunk_size);
             packet_size += chunk_size;
             
-            /* Move to next chunk */
             current_pos += chunk_size;
             remaining -= chunk_size;
             
             /* If we found a newline, process the complete packet */
             if (newline_pos) {
-                /* Write complete packet to file */
-                if (write_data_to_file(packet_buffer, packet_size) != 0) {
-                    syslog(LOG_ERR, "[Thread:%lu Client:%s] Failed to write packet to file",
-                           (unsigned long)thread_id, client_ip);
-                } else {
-                    /* Send entire file contents back to client */
-                    if (read_and_send_file(client_fd) == -1) {
-                        syslog(LOG_ERR, "[Thread:%lu Client:%s] Failed to send file contents", 
-                               (unsigned long)thread_id, client_ip);
-                    }
+                if (write_data_to_file(packet_buffer, packet_size) == 0) {
+                    read_and_send_file(client_fd);
                 }
-                
-                /* Reset for next packet */
-                packet_size = 0;
+                packet_size = 0; /* Reset for next packet */
             }
         }
     }
     
-    /* Cleanup and close connection */
+    /* Cleanup */
     free(packet_buffer);
     close(client_fd);
     
-    syslog(LOG_INFO, "[Thread:%lu Client:%s] Closed connection", 
-           (unsigned long)thread_id, client_ip);
+    syslog(LOG_INFO, "Closed connection from %s", client_ip);
+    remove_thread_from_list(pthread_self());
     
-    unregister_thread(pthread_self());
     return NULL;
 }
 
@@ -472,14 +461,11 @@ static void *connection_handler(void *arg)
  */
 static int run_as_daemon(void)
 {
-    pid_t pid;
-    
-    pid = fork();
+    pid_t pid = fork();
     if (pid < 0) {
         syslog(LOG_ERR, "First fork failed: %s", strerror(errno));
         return -1;
     }
-    
     if (pid > 0) {
         exit(EXIT_SUCCESS);
     }
@@ -494,7 +480,6 @@ static int run_as_daemon(void)
         syslog(LOG_ERR, "Second fork failed: %s", strerror(errno));
         return -1;
     }
-    
     if (pid > 0) {
         exit(EXIT_SUCCESS);
     }
@@ -503,51 +488,64 @@ static int run_as_daemon(void)
         syslog(LOG_WARNING, "Failed to change directory to /: %s", strerror(errno));
     }
     
-    /* Close all open file descriptors except server socket */
-    for (int fd = sysconf(_SC_OPEN_MAX); fd >= 0; fd--) {
-        if (fd != server_fd) {
-            close(fd);
-        }
-    }
+    close(STDIN_FILENO);
+    close(STDOUT_FILENO);
+    close(STDERR_FILENO);
     
-    /* Reopen stdin, stdout, stderr to /dev/null */
-    int null_fd = open("/dev/null", O_RDWR);
-    if (null_fd != -1) {
-        dup2(null_fd, STDIN_FILENO);
-        dup2(null_fd, STDOUT_FILENO);
-        dup2(null_fd, STDERR_FILENO);
-        if (null_fd > STDERR_FILENO) {
-            close(null_fd);
-        }
-    }
+    open("/dev/null", O_RDONLY);
+    open("/dev/null", O_WRONLY);
+    open("/dev/null", O_WRONLY);
     
     return 0;
 }
 
 /*
- * cleanup_resources - Clean up all resources before exit
+ * cleanup_resources - Clean up all resources
  */
 static void cleanup_resources(void)
 {
-    /* Wait for all active threads to complete */
-    wait_for_all_threads();
+    /* Signal shutdown and wake up timestamp thread */
+    shutdown_requested = true;
+    pthread_cond_signal(&timestamp_cond);
     
-    /* Close server socket if open */
+    /* Close server socket */
     if (server_fd != -1) {
         close(server_fd);
         server_fd = -1;
     }
     
-    /* Remove data file only after all threads have completed */
+    /* Close all client sockets to wake up connection threads */
+    pthread_mutex_lock(&thread_list_mutex);
+    struct thread_node *current = thread_list_head;
+    while (current) {
+        if (current->active) {
+            shutdown(current->client_fd, SHUT_RDWR);
+            close(current->client_fd);
+            current->active = false;
+        }
+        current = current->next;
+    }
+    pthread_mutex_unlock(&thread_list_mutex);
+    
+    /* Wait for timestamp thread */
+    if (timestamp_thread_running) {
+        pthread_join(timestamp_thread, NULL);
+    }
+    
+    /* Wait for all connection threads */
+    wait_for_all_threads();
+    
+    /* Remove data file */
     if (unlink(DATA_FILE) == -1 && errno != ENOENT) {
         syslog(LOG_WARNING, "Failed to remove data file: %s", strerror(errno));
     }
     
-    /* Destroy mutexes */
+    /* Destroy mutexes and condition variable */
     pthread_mutex_destroy(&file_mutex);
-    pthread_mutex_destroy(&threads_mutex);
+    pthread_mutex_destroy(&thread_list_mutex);
+    pthread_mutex_destroy(&timestamp_mutex);
+    pthread_cond_destroy(&timestamp_cond);
     
-    /* Close syslog */
     closelog();
 }
 
@@ -576,53 +574,54 @@ int main(int argc, char *argv[])
     openlog("aesdsocket", LOG_PID | LOG_CONS, LOG_USER);
     syslog(LOG_INFO, "Starting aesdsocket%s", daemon_mode ? " in daemon mode" : "");
     
-    /* Initialize thread pool */
-    memset(thread_pool, 0, sizeof(thread_pool));
+    /* Initialize mutexes and condition variable */
+    pthread_mutex_init(&file_mutex, NULL);
+    pthread_mutex_init(&thread_list_mutex, NULL);
+    pthread_mutex_init(&timestamp_mutex, NULL);
+    pthread_cond_init(&timestamp_cond, NULL);
     
     /* Set up signal handlers */
     if (setup_signal_handlers() == -1) {
+        cleanup_resources();
         return EXIT_FAILURE;
     }
     
     /* Set up server socket */
     server_fd = setup_server_socket();
     if (server_fd == -1) {
+        cleanup_resources();
         return EXIT_FAILURE;
     }
     
     /* Run as daemon if requested */
     if (daemon_mode) {
-        syslog(LOG_INFO, "Forking to run as daemon");
         if (run_as_daemon() == -1) {
             cleanup_resources();
             return EXIT_FAILURE;
         }
     }
     
+    /* Create timestamp thread */
+    if (pthread_create(&timestamp_thread, NULL, timestamp_thread_func, NULL) != 0) {
+        syslog(LOG_ERR, "Failed to create timestamp thread: %s", strerror(errno));
+        cleanup_resources();
+        return EXIT_FAILURE;
+    }
+    timestamp_thread_running = true;
+    
     /* Initialize thread attributes for joinable threads */
     pthread_attr_init(&thread_attr);
     pthread_attr_setdetachstate(&thread_attr, PTHREAD_CREATE_JOINABLE);
     
-    syslog(LOG_INFO, "Server listening on port %d (max %d concurrent connections)", 
-           PORT, MAX_CONCURRENT_THREADS);
+    syslog(LOG_INFO, "Server listening on port %d", PORT);
     
     /* Main server loop */
     while (!shutdown_requested) {
         client_len = sizeof(client_addr);
-        
-        /* Check if we can accept new connections */
-        if (!can_accept_new_connection()) {
-            /* Wait a bit before checking again */
-            usleep(100000); /* 100ms */
-            continue;
-        }
-        
-        /* Accept incoming connection */
         int client_fd = accept(server_fd, (struct sockaddr *)&client_addr, &client_len);
         
         if (client_fd == -1) {
             if (errno == EINTR && shutdown_requested) {
-                /* Interrupted by signal during shutdown */
                 break;
             }
             if (errno != EAGAIN && errno != EWOULDBLOCK) {
@@ -631,41 +630,27 @@ int main(int argc, char *argv[])
             continue;
         }
         
-        /* Get client IP address from accept() result */
-        char client_ip[INET_ADDRSTRLEN];
-        inet_ntop(AF_INET, &client_addr.sin_addr, client_ip, sizeof(client_ip));
-        
         /* Allocate thread arguments */
-        struct thread_args *thread_args = malloc(sizeof(struct thread_args));
-        
-        if (!thread_args) {
+        struct thread_args *args = malloc(sizeof(struct thread_args));
+        if (!args) {
             syslog(LOG_ERR, "Failed to allocate thread arguments");
             close(client_fd);
             continue;
         }
+        args->client_fd = client_fd;
+        args->client_addr = client_addr;
         
         /* Create thread to handle connection */
         pthread_t thread_id;
-        
-        /* Set up thread arguments BEFORE creating thread */
-        thread_args->client_fd = client_fd;
-        strncpy(thread_args->client_ip, client_ip, sizeof(thread_args->client_ip) - 1);
-        thread_args->client_ip[sizeof(thread_args->client_ip) - 1] = '\0';
-        thread_args->thread_id = (uint64_t)thread_id; /* Will be updated after pthread_create */
-        
-        if (pthread_create(&thread_id, &thread_attr, connection_handler, thread_args) != 0) {
-            syslog(LOG_ERR, "Failed to create thread for connection from %s: %s", 
-                   client_ip, strerror(errno));
-            free(thread_args);
+        if (pthread_create(&thread_id, &thread_attr, connection_handler, args) != 0) {
+            syslog(LOG_ERR, "Failed to create connection thread: %s", strerror(errno));
+            free(args);
             close(client_fd);
             continue;
         }
         
-        /* Update thread ID in arguments - need to pass it back to thread */
-        thread_args->thread_id = (uint64_t)thread_id;
-        
-        /* Register the thread */
-        register_thread(thread_id, client_fd, client_ip, (uint64_t)thread_id);
+        /* Add thread to management list */
+        add_thread_to_list(thread_id, client_fd, &client_addr);
     }
     
     /* Cleanup and exit */
