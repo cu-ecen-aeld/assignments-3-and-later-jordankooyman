@@ -12,7 +12,7 @@
 
 # Default compiler and flags
 CROSS_COMPILE ?=
-CC := $(CROSS_COMPILE)gcc
+CC ?= $(CROSS_COMPILE)gcc
 CFLAGS ?= -Wall -Werror -Wextra -g -O2
 LDFLAGS ?=
 
