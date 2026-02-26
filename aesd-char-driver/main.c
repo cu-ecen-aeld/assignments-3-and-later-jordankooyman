@@ -9,7 +9,8 @@
  *	Code Variation 2: https://chat.deepseek.com/share/blqdq52rrkyiuabq9f 
  *	Code Variation 3: https://chat.deepseek.com/share/dqf5xmgb4wjh0dinb4
  *	Code Variation 4 (kept): https://chat.deepseek.com/share/51svkx0j4vgx9uegsw
- *	Code Comparison: https://chatgpt.com/share/69a0abe9-1df4-8007-b644-419269c81357
+ *	Code Comparison & Error Tracing: https://chatgpt.com/share/69a0abe9-1df4-8007-b644-419269c81357
+ *  Code Correction: https://chat.deepseek.com/share/2ld00dp5jchxu8bru2
  *
  * @author Dan Walkes, Jordan Kooyman
  * @date 2019-10-22, 2026-02-26
@@ -33,6 +34,14 @@ int aesd_minor = 0;
 
 MODULE_AUTHOR("Jordan Kooyman");
 MODULE_LICENSE("Dual BSD/GPL");
+
+int aesd_open(struct inode *, struct file *);
+int aesd_release(struct inode *, struct file *);
+ssize_t aesd_read(struct file *, char __user *, size_t, loff_t *);
+ssize_t aesd_write(struct file *, const char __user *, size_t, loff_t *);
+loff_t aesd_llseek(struct file *, loff_t, int);
+int aesd_init_module(void);
+void aesd_cleanup_module(void);
 
 struct aesd_dev aesd_device;
 
@@ -67,41 +76,24 @@ static void aesd_add_entry_locked(struct aesd_dev *dev, const char *line, size_t
 int aesd_open(struct inode *inode, struct file *filp)
 {
     struct aesd_dev *dev = container_of(inode->i_cdev, struct aesd_dev, cdev);
-    struct aesd_file_private *priv;
-
     PDEBUG("open");
 
-    priv = kmalloc(sizeof(*priv), GFP_KERNEL);
-    if (!priv)
-        return -ENOMEM;
-
-    priv->dev = dev;
-    priv->partial_buf = NULL;
-    priv->partial_size = 0;
-    priv->partial_capacity = 0;
-
-    filp->private_data = priv;
+    /* Store the device pointer directly in private_data */
+    filp->private_data = dev;
     return 0;
 }
 
 int aesd_release(struct inode *inode, struct file *filp)
 {
-    struct aesd_file_private *priv = filp->private_data;
     PDEBUG("release");
-
-    if (priv) {
-        if (priv->partial_buf)
-            kfree(priv->partial_buf);
-        kfree(priv);
-    }
+    /* Nothing to free – the global partial buffer is managed by the device */
     return 0;
 }
 
 ssize_t aesd_read(struct file *filp, char __user *buf, size_t count,
                   loff_t *f_pos)
 {
-    struct aesd_file_private *priv = filp->private_data;
-    struct aesd_dev *dev = priv->dev;
+    struct aesd_dev *dev = filp->private_data;
     ssize_t retval = 0;
     size_t bytes_copied = 0;
     size_t offset = *f_pos;
@@ -144,89 +136,149 @@ out:
     return retval;
 }
 
-ssize_t aesd_write(struct file *filp, const char __user *buf, size_t count,
+ssize_t aesd_write(struct file *filp,
+                   const char __user *buf,
+                   size_t count,
                    loff_t *f_pos)
 {
-    struct aesd_file_private *priv = filp->private_data;
-    struct aesd_dev *dev = priv->dev;
-    ssize_t retval = count;   /* We'll return count on success */
-    size_t new_size;
-    size_t processed = 0;
+    struct aesd_dev *dev = filp->private_data;
+    ssize_t retval = count;
     size_t i;
     int error = 0;
 
-    PDEBUG("write %zu bytes with offset %lld", count, *f_pos);
-
-    /* Reject writes that exceed the maximum allowed size */
     if (count > AESDCHAR_MAX_WRITE_SIZE)
         return -ENOMEM;
 
-    mutex_lock(&dev->lock);   /* Serialise all writes */
+    mutex_lock(&dev->lock);
 
-    new_size = priv->partial_size + count;
+    /* Ensure global accumulation buffer capacity */
+    size_t new_size = dev->partial_size + count;
 
-    /* Ensure the per-file buffer is large enough */
-    if (priv->partial_capacity < new_size) {
-        size_t new_cap = max(priv->partial_capacity * 2, new_size);
+    if (dev->partial_capacity < new_size) {
+        size_t new_cap = max(dev->partial_capacity * 2, new_size);
+
         if (new_cap > AESDCHAR_MAX_WRITE_SIZE)
             new_cap = AESDCHAR_MAX_WRITE_SIZE;
+
         if (new_cap < new_size) {
             error = -ENOMEM;
             goto out_unlock;
         }
 
-        char *new_buf = krealloc(priv->partial_buf, new_cap, GFP_KERNEL);
+        char *new_buf = krealloc(dev->partial_buf, new_cap, GFP_KERNEL);
         if (!new_buf) {
             error = -ENOMEM;
             goto out_unlock;
         }
-        priv->partial_buf = new_buf;
-        priv->partial_capacity = new_cap;
+
+        dev->partial_buf = new_buf;
+        dev->partial_capacity = new_cap;
     }
 
-    /* Copy new data from user space */
-    if (copy_from_user(priv->partial_buf + priv->partial_size, buf, count)) {
+    /* Append user data */
+    if (copy_from_user(dev->partial_buf + dev->partial_size, buf, count)) {
         error = -EFAULT;
         goto out_unlock;
     }
-    priv->partial_size = new_size;
 
-    /* Scan the entire buffer for complete lines (terminated by '\n') */
-    processed = 0;
-    for (i = 0; i < priv->partial_size; i++) {
-        if (priv->partial_buf[i] == '\n') {
-            size_t line_len = i - processed + 1;
-            char *line_buf = kmalloc(line_len, GFP_KERNEL);
-            if (!line_buf) {
-                error = -ENOMEM;
-                /* Stop processing; lines already added remain in the buffer */
-                break;
-            }
-            memcpy(line_buf, priv->partial_buf + processed, line_len);
+    dev->partial_size += count;
 
-            /* Add the line to the circular buffer (lock already held) */
-            aesd_add_entry_locked(dev, line_buf, line_len);
+    /*
+     * Scan for complete newline-terminated commands.
+     * IMPORTANT: Keep any leftover data for the next write.
+     */
+    size_t line_start = 0;
 
-            processed = i + 1;   /* Move past this line */
+    for (i = 0; i < dev->partial_size; i++) {
+
+        if (dev->partial_buf[i] != '\n')
+            continue;
+
+        size_t line_len = i - line_start + 1;
+
+        char *line_buf = kmalloc(line_len, GFP_KERNEL);
+        if (!line_buf) {
+            error = -ENOMEM;
+            goto out_unlock;
         }
+
+        memcpy(line_buf,
+               dev->partial_buf + line_start,
+               line_len);
+
+        aesd_add_entry_locked(dev, line_buf, line_len);
+
+        line_start = i + 1;
     }
 
-    /* Any remaining data becomes the new partial buffer */
-    if (processed < priv->partial_size) {
-        size_t leftover = priv->partial_size - processed;
-        memmove(priv->partial_buf, priv->partial_buf + processed, leftover);
-        priv->partial_size = leftover;
-    } else {
-        /* All data was consumed; free the buffer to save memory */
-        kfree(priv->partial_buf);
-        priv->partial_buf = NULL;
-        priv->partial_size = 0;
-        priv->partial_capacity = 0;
+    /*
+     * Preserve leftover partial command (if any)
+     * by shifting it to the start of the buffer.
+     */
+    if (line_start > 0) {
+        size_t leftover = dev->partial_size - line_start;
+
+        if (leftover > 0) {
+            memmove(dev->partial_buf,
+                    dev->partial_buf + line_start,
+                    leftover);
+        }
+
+        dev->partial_size = leftover;
     }
+
+    /*
+     * DO NOT free partial_buf when empty.
+     * Keep allocation for future writes to avoid churn.
+     */
 
 out_unlock:
     mutex_unlock(&dev->lock);
     return error ? error : retval;
+}
+
+loff_t aesd_llseek(struct file *filp, loff_t off, int whence)
+{
+    struct aesd_dev *dev = filp->private_data;
+    loff_t newpos = 0;
+    size_t total_size = 0;
+    uint8_t index;
+    struct aesd_buffer_entry *entry;
+
+    mutex_lock(&dev->lock);
+
+    /* Compute total size of stored data */
+    AESD_CIRCULAR_BUFFER_FOREACH(entry, &dev->buffer, index) {
+        total_size += entry->size;
+    }
+
+    switch (whence) {
+    case SEEK_SET:
+        newpos = off;
+        break;
+
+    case SEEK_CUR:
+        newpos = filp->f_pos + off;
+        break;
+
+    case SEEK_END:
+        newpos = total_size + off;
+        break;
+
+    default:
+        mutex_unlock(&dev->lock);
+        return -EINVAL;
+    }
+
+    if (newpos < 0 || newpos > total_size) {
+        mutex_unlock(&dev->lock);
+        return -EINVAL;
+    }
+
+    filp->f_pos = newpos;
+
+    mutex_unlock(&dev->lock);
+    return newpos;
 }
 
 struct file_operations aesd_fops = {
@@ -235,7 +287,7 @@ struct file_operations aesd_fops = {
     .write   = aesd_write,
     .open    = aesd_open,
     .release = aesd_release,
-    .llseek  = no_llseek,   /* No seeking support */
+    .llseek  = aesd_llseek
 };
 
 static int aesd_setup_cdev(struct aesd_dev *dev)
@@ -267,6 +319,11 @@ int aesd_init_module(void)
     mutex_init(&aesd_device.lock);
     aesd_circular_buffer_init(&aesd_device.buffer);
 
+    /* Initialize global partial‑line buffer fields */
+    aesd_device.partial_buf = NULL;
+    aesd_device.partial_size = 0;
+    aesd_device.partial_capacity = 0;
+
     result = aesd_setup_cdev(&aesd_device);
     if (result) {
         unregister_chrdev_region(dev, 1);
@@ -290,6 +347,10 @@ void aesd_cleanup_module(void)
             kfree(entry->buffptr);
         }
     }
+
+    /* Free any leftover partial data */
+    if (aesd_device.partial_buf)
+        kfree(aesd_device.partial_buf);
 
     mutex_destroy(&aesd_device.lock);
     unregister_chrdev_region(devno, 1);

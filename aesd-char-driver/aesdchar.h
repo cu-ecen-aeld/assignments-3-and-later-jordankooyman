@@ -8,8 +8,8 @@
  *	Code Variation 2: https://chat.deepseek.com/share/blqdq52rrkyiuabq9f 
  *	Code Variation 3: https://chat.deepseek.com/share/dqf5xmgb4wjh0dinb4
  *	Code Variation 4 (kept): https://chat.deepseek.com/share/51svkx0j4vgx9uegsw
- *	Code Comparison: https://chatgpt.com/share/69a0abe9-1df4-8007-b644-419269c81357
- * 
+ *	Code Comparison & Error Tracing: https://chatgpt.com/share/69a0abe9-1df4-8007-b644-419269c81357
+ *  Code Correction: https://chat.deepseek.com/share/2ld00dp5jchxu8bru2
  */
 
 #ifndef AESD_CHAR_DRIVER_AESDCHAR_H_
@@ -63,11 +63,13 @@ struct aesd_file_private {
  *
  * One instance exists for the whole driver (@aesd_device).
  */
-struct aesd_dev
-{
+struct aesd_dev {
     struct cdev cdev;
-    struct mutex lock;
     struct aesd_circular_buffer buffer;
+    struct mutex lock;
+    char *partial_buf;      /* accumulation buffer for partial lines */
+    size_t partial_size;     /* current bytes in partial_buf */
+    size_t partial_capacity; /* allocated size of partial_buf */
 };
 
 #endif /* AESD_CHAR_DRIVER_AESDCHAR_H_ */
