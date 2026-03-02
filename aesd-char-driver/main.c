@@ -13,7 +13,7 @@
  *  Code Correction: https://chat.deepseek.com/share/2ld00dp5jchxu8bru2
  * Assignment 9 updates:
  *  Code Variation 1: https://chat.deepseek.com/share/t2cwufojtyfo0nnkrl
- *  Code Variation 2: https://chat.deepseek.com/share/sjubfkc2gax9b824li
+ *  Code Variation 2 (used): https://chat.deepseek.com/share/829vw2j4w8bugz5zkw
  *  Code Comparison: https://chatgpt.com/share/69a5e166-2100-8007-9e79-35fa43b28134
  *
  * @author Dan Walkes, Jordan Kooyman
@@ -50,10 +50,11 @@ long aesd_unlocked_ioctl(struct file *, unsigned int, unsigned long);
 static long aesd_adjust_file_offset_locked(struct file *filp,
                                            unsigned int write_cmd,
                                            unsigned int write_cmd_offset);
+static void aesd_add_entry_locked(struct aesd_dev *dev, const char *line, size_t size);
 
 struct aesd_dev aesd_device;
 
-/* ---------- Helper (must be called with dev->lock held) ---------- */
+/* ---------- Helper: adjust file offset (must be called with dev->lock held) ---------- */
 static long aesd_adjust_file_offset_locked(struct file *filp,
                                            unsigned int write_cmd,
                                            unsigned int write_cmd_offset)
@@ -98,6 +99,28 @@ static long aesd_adjust_file_offset_locked(struct file *filp,
 
     /* Should never reach here if validation passed */
     return -EINVAL;
+}
+
+/* ---------- Circular buffer helper with total_size update ---------- */
+static void aesd_add_entry_locked(struct aesd_dev *dev, const char *line, size_t size)
+{
+    /* If the buffer is full, free the entry that will be overwritten */
+    if (dev->buffer.full) {
+        struct aesd_buffer_entry *old = &dev->buffer.entry[dev->buffer.in_offs];
+        if (old->buffptr) {
+            dev->total_size -= old->size;   /* subtract size of overwritten entry */
+            kfree(old->buffptr);
+            old->buffptr = NULL;
+            old->size = 0;
+        }
+    }
+
+    struct aesd_buffer_entry new_entry = {
+        .buffptr = line,
+        .size = size
+    };
+    aesd_circular_buffer_add_entry(&dev->buffer, &new_entry);
+    dev->total_size += size;   /* add size of new entry */
 }
 
 /* ---------- unlocked_ioctl ---------- */
@@ -300,7 +323,7 @@ out_unlock:
     return error ? error : retval;
 }
 
-/* ---------- file operations ---------- */
+/* ---------- file operations structure ---------- */
 struct file_operations aesd_fops = {
     .owner          = THIS_MODULE,
     .read           = aesd_read,
@@ -311,34 +334,7 @@ struct file_operations aesd_fops = {
     .unlocked_ioctl = aesd_unlocked_ioctl,
 };
 
-/**
- * aesd_add_entry_locked() - Add a completed line to the circular buffer.
- * @dev:  Device structure (with lock already held)
- * @line: Pointer to the line buffer (must be kmalloc'd)
- * @size: Length of the line (including newline)
- *
- * If the circular buffer is full, the oldest entry is freed before adding.
- * The caller must hold @dev->lock.
- */
-static void aesd_add_entry_locked(struct aesd_dev *dev, const char *line, size_t size)
-{
-    /* If the buffer is full, free the entry that will be overwritten */
-    if (dev->buffer.full) {
-        struct aesd_buffer_entry *old = &dev->buffer.entry[dev->buffer.in_offs];
-        if (old->buffptr) {
-            kfree(old->buffptr);
-            old->buffptr = NULL;
-            old->size = 0;
-        }
-    }
-
-    struct aesd_buffer_entry new_entry = {
-        .buffptr = line,
-        .size = size
-    };
-    aesd_circular_buffer_add_entry(&dev->buffer, &new_entry);
-}
-
+/* ---------- open ---------- */
 int aesd_open(struct inode *inode, struct file *filp)
 {
     struct aesd_dev *dev = container_of(inode->i_cdev, struct aesd_dev, cdev);
@@ -349,6 +345,7 @@ int aesd_open(struct inode *inode, struct file *filp)
     return 0;
 }
 
+/* ---------- release ---------- */
 int aesd_release(struct inode *inode, struct file *filp)
 {
     PDEBUG("release");
@@ -356,6 +353,7 @@ int aesd_release(struct inode *inode, struct file *filp)
     return 0;
 }
 
+/* ---------- read ---------- */
 ssize_t aesd_read(struct file *filp, char __user *buf, size_t count,
                   loff_t *f_pos)
 {
@@ -402,107 +400,7 @@ out:
     return retval;
 }
 
-ssize_t aesd_write(struct file *filp,
-                   const char __user *buf,
-                   size_t count,
-                   loff_t *f_pos)
-{
-    struct aesd_dev *dev = filp->private_data;
-    ssize_t retval = count;
-    size_t i;
-    int error = 0;
-
-    if (count > AESDCHAR_MAX_WRITE_SIZE)
-        return -ENOMEM;
-
-    mutex_lock(&dev->lock);
-
-    /* Ensure global accumulation buffer capacity */
-    size_t new_size = dev->partial_size + count;
-
-    if (dev->partial_capacity < new_size) {
-        size_t new_cap = max(dev->partial_capacity * 2, new_size);
-
-        if (new_cap > AESDCHAR_MAX_WRITE_SIZE)
-            new_cap = AESDCHAR_MAX_WRITE_SIZE;
-
-        if (new_cap < new_size) {
-            error = -ENOMEM;
-            goto out_unlock;
-        }
-
-        char *new_buf = krealloc(dev->partial_buf, new_cap, GFP_KERNEL);
-        if (!new_buf) {
-            error = -ENOMEM;
-            goto out_unlock;
-        }
-
-        dev->partial_buf = new_buf;
-        dev->partial_capacity = new_cap;
-    }
-
-    /* Append user data */
-    if (copy_from_user(dev->partial_buf + dev->partial_size, buf, count)) {
-        error = -EFAULT;
-        goto out_unlock;
-    }
-
-    dev->partial_size += count;
-
-    /*
-     * Scan for complete newline-terminated commands.
-     * IMPORTANT: Keep any leftover data for the next write.
-     */
-    size_t line_start = 0;
-
-    for (i = 0; i < dev->partial_size; i++) {
-
-        if (dev->partial_buf[i] != '\n')
-            continue;
-
-        size_t line_len = i - line_start + 1;
-
-        char *line_buf = kmalloc(line_len, GFP_KERNEL);
-        if (!line_buf) {
-            error = -ENOMEM;
-            goto out_unlock;
-        }
-
-        memcpy(line_buf,
-               dev->partial_buf + line_start,
-               line_len);
-
-        aesd_add_entry_locked(dev, line_buf, line_len);
-
-        line_start = i + 1;
-    }
-
-    /*
-     * Preserve leftover partial command (if any)
-     * by shifting it to the start of the buffer.
-     */
-    if (line_start > 0) {
-        size_t leftover = dev->partial_size - line_start;
-
-        if (leftover > 0) {
-            memmove(dev->partial_buf,
-                    dev->partial_buf + line_start,
-                    leftover);
-        }
-
-        dev->partial_size = leftover;
-    }
-
-    /*
-     * DO NOT free partial_buf when empty.
-     * Keep allocation for future writes to avoid churn.
-     */
-
-out_unlock:
-    mutex_unlock(&dev->lock);
-    return error ? error : retval;
-}
-
+/* ---------- setup cdev ---------- */
 static int aesd_setup_cdev(struct aesd_dev *dev)
 {
     int err, devno = MKDEV(aesd_major, aesd_minor);
@@ -515,6 +413,7 @@ static int aesd_setup_cdev(struct aesd_dev *dev)
     return err;
 }
 
+/* ---------- module init ---------- */
 int aesd_init_module(void)
 {
     dev_t dev = 0;
@@ -546,6 +445,7 @@ int aesd_init_module(void)
     return result;
 }
 
+/* ---------- module cleanup ---------- */
 void aesd_cleanup_module(void)
 {
     dev_t devno = MKDEV(aesd_major, aesd_minor);
