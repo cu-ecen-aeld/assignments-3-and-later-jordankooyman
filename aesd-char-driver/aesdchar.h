@@ -19,7 +19,7 @@
 #include <linux/mutex.h>
 #include "aesd-circular-buffer.h"
 
-#define AESD_DEBUG 1  // Remove comment to enable debug
+#define AESD_DEBUG 1  /* Remove comment to enable debug */
 
 #undef PDEBUG
 #ifdef AESD_DEBUG
@@ -32,21 +32,19 @@
 #  define PDEBUG(fmt, args...) /* nothing */
 #endif
 
-/** Maximum size of a single write operation (to avoid high-order allocations) */
+/** Maximum size of a single write operation (to avoid high‑order allocations) */
 #define AESDCHAR_MAX_WRITE_SIZE (128 * 1024)   /* 128 KiB */
 
 /**
- * struct aesd_file_private - Per-file private data
- * @dev:           Pointer to the main device structure (for convenience)
+ * struct aesd_file_private - Per‑file private data (currently unused)
+ * @dev:           Pointer to the main device structure
  * @partial_buf:   Dynamically allocated buffer holding partial write data
- *                 (data not yet terminated by a newline)
  * @partial_size:  Number of valid bytes currently in @partial_buf
- * @partial_capacity: Allocated size of @partial_buf (for efficient reallocation)
+ * @partial_capacity: Allocated size of @partial_buf
  *
- * This structure is allocated in @aesd_open and freed in @aesd_release.
- * It holds incomplete write data for a specific open file instance.
- * All writes are serialised by the global device lock, so no per‑file lock
- * is needed.
+ * This structure is intended for per‑open file data but is not yet used.
+ * The current driver uses global partial buffers, which is not safe for
+ * concurrent opens. This is a known limitation.
  */
 struct aesd_file_private {
     struct aesd_dev *dev;
@@ -57,9 +55,13 @@ struct aesd_file_private {
 
 /**
  * struct aesd_dev - Main device structure
- * @cdev:   Char device structure (must be first for cdev_init)
- * @lock:   Mutex protecting the circular buffer and serialising all writes
- * @buffer: Circular buffer holding the most recent completed write commands
+ * @cdev:        Char device structure (must be first for cdev_init)
+ * @lock:        Mutex protecting the circular buffer and serialising all writes
+ * @buffer:      Circular buffer holding the most recent completed write commands
+ * @partial_buf:   Global accumulation buffer for incomplete lines
+ * @partial_size:  Current bytes in @partial_buf
+ * @partial_capacity: Allocated size of @partial_buf
+ * @total_size:     Total size (in bytes) of all data currently stored in @buffer
  *
  * One instance exists for the whole driver (@aesd_device).
  */
@@ -67,9 +69,10 @@ struct aesd_dev {
     struct cdev cdev;
     struct aesd_circular_buffer buffer;
     struct mutex lock;
-    char *partial_buf;      /* accumulation buffer for partial lines */
-    size_t partial_size;     /* current bytes in partial_buf */
-    size_t partial_capacity; /* allocated size of partial_buf */
+    char *partial_buf;
+    size_t partial_size;
+    size_t partial_capacity;
+    size_t total_size;                /* sum of sizes of all entries in buffer */
 };
 
 #endif /* AESD_CHAR_DRIVER_AESDCHAR_H_ */
