@@ -3,6 +3,7 @@
 #   Version 2 Code (this): https://chat.deepseek.com/share/v6z76kub49dzcpxmqa
 #     Comparison: https://chatgpt.com/share/697cea7e-2700-8007-8fa5-a7edea60a08d
 #   Assignment 9 Revision: https://claude.ai/share/940b08c1-937e-4f59-9fe4-db34cee65a86
+#	Correction: https://claude.ai/share/9a4a44e3-7fa6-4ed8-9f63-768d2319d8ad
 #
 # Usage:
 #   make                              # Auto-detect aesd_ioctl.h, build for host
@@ -47,7 +48,7 @@ ifneq ($(IOCTL_HEADER),)
     # Header found: add the driver directory to the include path and define
     # the flag that switches aesdsocket.c from its inline fallback to the
     # real shared header.
-    CFLAGS += -I$(DRIVER_DIR) -DHAVE_AESD_IOCTL_H
+    override CFLAGS += -I$(DRIVER_DIR) -DHAVE_AESD_IOCTL_H
     $(info aesd_ioctl.h found at $(IOCTL_HEADER) — using project header)
 else
     # Header not found: the inline fallback definitions in aesdsocket.c will

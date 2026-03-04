@@ -123,7 +123,7 @@
       *                        for kernel copyin/copyout size validation.
       *   direction (30-31) : _IOW = data flows user-space -> driver ("write").
       */
-#    define AESDCHAR_IOCSEEKTO _IOW(AESD_IOC_MAGIC, 1, struct aesd_seekto)
+#    define AESDCHAR_IOCSEEKTO _IOWR(AESD_IOC_MAGIC, 1, struct aesd_seekto)
 #  endif
 #endif /* HAVE_AESD_IOCTL_H */
 
